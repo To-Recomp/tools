@@ -166,13 +166,21 @@ def match_reference(label, dol_path, symbols_path, splits_path, tgt, starts, min
             if score >= fuzzy_threshold and refs[i][0] in ref_by_name:
                 r = refs[i]
                 start = a
+                k = bisect.bisect_left(starts, a)
                 if words[:4] != r[3][:4]:
                     # The CFG may start a "function" inside the real one: look back a few starts.
-                    k = bisect.bisect_left(starts, a)
                     for back in range(1, 4):
                         if k - back >= 0 and target_words.get(starts[k - back], ())[:4] == r[3][:4]:
                             start = starts[k - back]
                             break
+                if start == a and k > 0:
+                    # A start that follows code with no return or tail branch is inside that code:
+                    # the function really begins at the previous start (within 64 bytes).
+                    p = starts[k - 1]
+                    pw = target_words.get(p, ())
+                    between = pw[: (a - p) // 4]
+                    if a - p <= 0x40 and between and not any(w in (0x4E800020, 0x4E800420) or (w & 0xFC000003) == 0x48000000 for w in between):
+                        start = p
                 cands.append({"addr": start, "name": r[0], "unit": r[1], "ref": r[2], "method": "fuzzy", "score": round(score, 2)})
     cands.sort(key=lambda c: c["addr"])
     chain = heaviest_chain(cands)
@@ -209,6 +217,7 @@ def main():
     ap.add_argument("--out-prefix", required=True)
     ap.add_argument("--min-exact-words", type=int, default=6)
     ap.add_argument("--fuzzy-threshold", type=float, default=0.6)
+    ap.add_argument("--manual", help="file of 'addr,name  # evidence' lines that override automatic matches")
     args = ap.parse_args()
 
     tgt = Dol(open(args.target_dol, "rb").read())
@@ -242,12 +251,23 @@ def main():
     for a, n1, n2 in conflicts:
         merged.pop(a, None)
 
+    # Names established by hand from behavior (each line carries its evidence).
+    if args.manual:
+        for line in open(args.manual):
+            line = line.split("#", 1)[0].strip()
+            if not line:
+                continue
+            addr_text, name = [x.strip() for x in line.split(",", 1)]
+            a = int(addr_text, 16)
+            merged[a] = {"addr": a, "name": name, "unit": "manual", "ref": 0, "method": "manual", "score": 1.0,
+                         "start_ok": True, "agreed": True, "reference": "manual"}
+
     with open(args.out_prefix + ".csv", "w") as f:
         f.write("# Dolphin SDK function names for a stripped DOL, from tools/sdk-identify. addr,name\n")
         f.write("# Only entries whose start is verified (first instructions equal the reference's) or that two\n")
         f.write("# independent references name identically.\n")
         for a in sorted(merged):
-            if merged[a]["start_ok"] or merged[a].get("agreed"):
+            if merged[a]["start_ok"] or (merged[a].get("agreed") and merged[a]["method"] != "layout"):
                 f.write(f"0x{a:08X},{merged[a]['name']}\n")
     with open(args.out_prefix + ".matches.tsv", "w") as f:
         f.write("address\tname\tmethod\tscore\tstart_ok\tagreed\tunit\treference\n")
